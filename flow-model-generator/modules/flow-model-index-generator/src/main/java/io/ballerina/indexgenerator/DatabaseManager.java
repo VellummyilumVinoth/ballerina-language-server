@@ -33,7 +33,7 @@ import java.util.logging.Logger;
 class DatabaseManager {
 
     private static final Logger LOGGER = Logger.getLogger(DatabaseManager.class.getName());
-    private static final String INDEX_FILE_NAME = "central-index.sqlite";
+    private static final String INDEX_FILE_NAME = "central-index-enhanced.sqlite";
     private static final String CENTRAL_INDEX_SQL = "central-index.sql";
     private static final String dbPath = getDatabasePath();
 
@@ -177,5 +177,133 @@ class DatabaseManager {
         } catch (SQLException e) {
             LOGGER.severe("Error updating return types: " + e.getMessage());
         }
+    }
+
+    public static int insertTypeDefinition(int packageId, String name, String description, String typeCategory,
+                                           String baseType) {
+        String sql = "INSERT INTO TypeDefinition (package_id, name, description, type_category, base_type) " +
+                    "VALUES (?, ?, ?, ?, ?)";
+        return insertEntry(sql, new Object[]{packageId, name, description, typeCategory, baseType});
+    }
+
+    public static int insertRecordField(int typeId, String name, String description, String fieldType, int optional) {
+        String sql = "INSERT INTO RecordField (type_id, name, description, field_type, optional) " +
+                    "VALUES (?, ?, ?, ?, ?)";
+        return insertEntry(sql, new Object[]{typeId, name, description, fieldType, optional});
+    }
+
+    public static void insertEnumMember(int typeId, String name, String description, int ordinal) {
+        String sql = "INSERT INTO EnumMember (type_id, name, description, ordinal) VALUES (?, ?, ?, ?)";
+        insertEntry(sql, new Object[]{typeId, name, description, ordinal});
+    }
+
+    public static void insertUnionMember(int typeId, String memberTypeName, int ordinal) {
+        String sql = "INSERT INTO UnionMember (type_id, member_type_name, ordinal) VALUES (?, ?, ?)";
+        insertEntry(sql, new Object[]{typeId, memberTypeName, ordinal});
+    }
+
+    public static void insertClassMethod(int classTypeId, int functionId, String methodType) {
+        String sql = "INSERT INTO ClassMethod (class_type_id, function_id, method_type) VALUES (?, ?, ?)";
+        insertEntry(sql, new Object[]{classTypeId, functionId, methodType});
+    }
+
+    public static int insertClientDefinition(int packageId, String name, String description) {
+        String sql = "INSERT INTO ClientDefinition (package_id, name, description) VALUES (?, ?, ?)";
+        return insertEntry(sql, new Object[]{packageId, name, description});
+    }
+
+    public static void insertServiceDefinition(int packageId, String serviceType, String instructions,
+                                              String listenerName, String listenerConfig,
+                                              String testGenerationInstruction) {
+        String sql = "INSERT INTO ServiceDefinition (package_id, service_type, instructions, listener_name, " +
+                    "listener_config, test_generation_instruction) VALUES (?, ?, ?, ?, ?, ?)";
+        insertEntry(sql, new Object[]{packageId, serviceType, instructions, listenerName, listenerConfig,
+                                      testGenerationInstruction});
+    }
+
+    public static void insertTypeLink(int sourceFieldId, String targetTypeName, String category,
+                                     String packageOrg, String packageName) {
+        String sql = "INSERT INTO TypeLink (source_field_id, target_type_name, category, package_org, package_name) " +
+                    "VALUES (?, ?, ?, ?, ?)";
+        insertEntry(sql, new Object[]{sourceFieldId, targetTypeName, category, packageOrg, packageName});
+    }
+
+    // ===== Helper Query Methods =====
+
+    /**
+     *
+     * Get package_id by package name (format: "org/package").
+     */
+    public static int getPackageIdByName(String fullPackageName) {
+        // Parse "ballerina/http" format
+        String[] parts = fullPackageName.split("/");
+        if (parts.length != 2) {
+            LOGGER.warning("Invalid package name format: " + fullPackageName);
+            return -1;
+        }
+
+        String org = parts[0];
+        String packageName = parts[1];
+
+        String sql = "SELECT package_id FROM Package WHERE org = ? AND package_name = ?";
+
+        try (Connection conn = DriverManager.getConnection(dbPath);
+             PreparedStatement stmt = conn.prepareStatement(sql)) {
+            stmt.setString(1, org);
+            stmt.setString(2, packageName);
+
+            ResultSet rs = stmt.executeQuery();
+            if (rs.next()) {
+                return rs.getInt("package_id");
+            }
+        } catch (SQLException e) {
+            LOGGER.severe("Error querying package: " + e.getMessage());
+        }
+
+        return -1;
+    }
+
+    /**
+     * Get type_id by name within a package.
+     */
+    public static int getTypeIdByName(int packageId, String typeName) {
+        String sql = "SELECT type_id FROM TypeDefinition WHERE package_id = ? AND name = ?";
+
+        try (Connection conn = DriverManager.getConnection(dbPath);
+             PreparedStatement stmt = conn.prepareStatement(sql)) {
+            stmt.setInt(1, packageId);
+            stmt.setString(2, typeName);
+
+            ResultSet rs = stmt.executeQuery();
+            if (rs.next()) {
+                return rs.getInt("type_id");
+            }
+        } catch (SQLException e) {
+            LOGGER.severe("Error querying type: " + e.getMessage());
+        }
+
+        return -1;
+    }
+
+    /**
+     * Get field_id for a record field.
+     */
+    public static int getRecordFieldId(int typeId, String fieldName) {
+        String sql = "SELECT field_id FROM RecordField WHERE type_id = ? AND name = ?";
+
+        try (Connection conn = DriverManager.getConnection(dbPath);
+             PreparedStatement stmt = conn.prepareStatement(sql)) {
+            stmt.setInt(1, typeId);
+            stmt.setString(2, fieldName);
+
+            ResultSet rs = stmt.executeQuery();
+            if (rs.next()) {
+                return rs.getInt("field_id");
+            }
+        } catch (SQLException e) {
+            LOGGER.severe("Error querying record field: " + e.getMessage());
+        }
+
+        return -1;
     }
 }

@@ -23,12 +23,20 @@ import com.google.gson.reflect.TypeToken;
 import io.ballerina.compiler.api.SemanticModel;
 import io.ballerina.compiler.api.symbols.ClassSymbol;
 import io.ballerina.compiler.api.symbols.Documentable;
+import io.ballerina.compiler.api.symbols.Documentation;
+import io.ballerina.compiler.api.symbols.EnumSymbol;
 import io.ballerina.compiler.api.symbols.FunctionSymbol;
 import io.ballerina.compiler.api.symbols.MethodSymbol;
 import io.ballerina.compiler.api.symbols.Qualifier;
+import io.ballerina.compiler.api.symbols.RecordFieldSymbol;
+import io.ballerina.compiler.api.symbols.RecordTypeSymbol;
 import io.ballerina.compiler.api.symbols.Symbol;
 import io.ballerina.compiler.api.symbols.SymbolKind;
+import io.ballerina.compiler.api.symbols.TypeDefinitionSymbol;
+import io.ballerina.compiler.api.symbols.TypeDescKind;
 import io.ballerina.compiler.api.symbols.TypeSymbol;
+import io.ballerina.compiler.api.symbols.UnionTypeSymbol;
+import io.ballerina.modelgenerator.commons.CommonUtils;
 import io.ballerina.modelgenerator.commons.FunctionData;
 import io.ballerina.modelgenerator.commons.FunctionDataBuilder;
 import io.ballerina.modelgenerator.commons.ModuleInfo;
@@ -40,11 +48,10 @@ import io.ballerina.projects.ModuleDescriptor;
 import io.ballerina.projects.Package;
 import io.ballerina.projects.directory.BuildProject;
 
-import java.io.FileReader;
 import java.io.IOException;
+import java.io.InputStreamReader;
 import java.net.URL;
 import java.nio.charset.StandardCharsets;
-import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
@@ -70,7 +77,8 @@ class IndexGenerator {
 
         Gson gson = new Gson();
         URL resource = IndexGenerator.class.getClassLoader().getResource(PackageListGenerator.PACKAGE_JSON_FILE);
-        try (FileReader reader = new FileReader(Objects.requireNonNull(resource).getFile(), StandardCharsets.UTF_8)) {
+        try (InputStreamReader reader = new InputStreamReader(Objects.requireNonNull(resource).openStream(),
+                StandardCharsets.UTF_8)) {
             Map<String, List<PackageListGenerator.PackageMetadataInfo>> packagesMap = gson.fromJson(reader,
                     typeToken);
             ForkJoinPool forkJoinPool = new ForkJoinPool(Runtime.getRuntime().availableProcessors());
@@ -160,6 +168,32 @@ class IndexGenerator {
         TypeSymbol errorTypeSymbol = semanticModel.types().ERROR;
 
         for (Symbol symbol : semanticModel.moduleSymbols()) {
+            // Process type definitions (records, enums, unions, etc.)
+            if (symbol.kind() == SymbolKind.TYPE_DEFINITION) {
+                TypeDefinitionSymbol typeDefSymbol = (TypeDefinitionSymbol) symbol;
+                if (!typeDefSymbol.qualifiers().contains(Qualifier.PUBLIC)) {
+                    continue;
+                }
+                processTypeDefinition(typeDefSymbol, packageId, semanticModel, module);
+                continue;
+            }
+
+            // Process enum types
+            if (symbol.kind() == SymbolKind.ENUM) {
+                EnumSymbol enumSymbol = (EnumSymbol) symbol;
+                if (!enumSymbol.qualifiers().contains(Qualifier.PUBLIC)) {
+                    continue;
+                }
+                processEnumType(enumSymbol, packageId);
+                continue;
+            }
+
+            // Process service declarations
+            if (symbol.kind() == SymbolKind.SERVICE_DECLARATION) {
+                processServiceDeclaration(symbol, packageId);
+                continue;
+            }
+
             if (symbol.kind() == SymbolKind.FUNCTION) {
                 FunctionSymbol functionSymbol = (FunctionSymbol) symbol;
                 if (!functionSymbol.qualifiers().contains(Qualifier.PUBLIC)) {
@@ -172,53 +206,101 @@ class IndexGenerator {
             }
             if (symbol.kind() == SymbolKind.CLASS) {
                 ClassSymbol classSymbol = (ClassSymbol) symbol;
-                if (hasAllQualifiers(classSymbol.qualifiers(), List.of(Qualifier.PUBLIC, Qualifier.CLIENT))) {
+
+                // Process all public classes (not just clients)
+                if (!classSymbol.qualifiers().contains(Qualifier.PUBLIC)) {
                     continue;
                 }
 
+                // Insert class as TypeDefinition
+                Optional<String> classNameOpt = classSymbol.getName();
+                if (classNameOpt.isEmpty()) {
+                    continue;
+                }
+                String className = classNameOpt.get();
+                String classDescription = getDescription(classSymbol);
+
+                int classTypeId = DatabaseManager.insertTypeDefinition(
+                    packageId, className, classDescription, "Class", null
+                );
+
+                if (classTypeId == -1) {
+                    LOGGER.warning("Failed to insert class type: " + className);
+                    continue;
+                }
+
+                // Special handling for Client classes
+                boolean isClient = classSymbol.nameEquals("Client");
+                int clientId = -1;
+
+                if (isClient) {
+                    clientId = DatabaseManager.insertClientDefinition(packageId, className, classDescription);
+                    if (clientId == -1) {
+                        LOGGER.warning("Failed to insert client definition: " + className);
+                    }
+                }
+
+                // Process init method if present
                 Optional<MethodSymbol> initMethodSymbol = classSymbol.initMethod();
-                if (initMethodSymbol.isEmpty()) {
-                    continue;
-                }
-                if (!classSymbol.nameEquals("Client")) {
-                    continue;
-                }
-                int connectorId = processFunctionSymbol(semanticModel, initMethodSymbol.get(), classSymbol, packageId,
-                        FunctionType.CONNECTOR,
-                        moduleName, errorTypeSymbol, module);
-                if (connectorId == -1) {
-                    continue;
+                if (initMethodSymbol.isPresent()) {
+                    FunctionType funcType = isClient ? FunctionType.CONNECTOR : FunctionType.FUNCTION;
+                    int functionId = processFunctionSymbol(
+                        semanticModel, initMethodSymbol.get(), classSymbol,
+                        packageId, funcType, moduleName, errorTypeSymbol, module
+                    );
+
+                    if (functionId != -1) {
+                        // Link method to class via ClassMethod table
+                        DatabaseManager.insertClassMethod(classTypeId, functionId, "Constructor");
+
+                        if (isClient && clientId != -1) {
+                            DatabaseManager.mapConnectorAction(functionId, clientId);
+                        }
+                    }
                 }
 
-                // Process the actions of the client
+                // Process all public methods
                 Map<String, MethodSymbol> methods = classSymbol.methods();
                 for (Map.Entry<String, MethodSymbol> entry : methods.entrySet()) {
                     MethodSymbol methodSymbol = entry.getValue();
-
                     List<Qualifier> qualifiers = methodSymbol.qualifiers();
+
+                    if (!qualifiers.contains(Qualifier.PUBLIC) &&
+                        !qualifiers.contains(Qualifier.REMOTE) &&
+                        !qualifiers.contains(Qualifier.RESOURCE)) {
+                        continue;
+                    }
+
                     FunctionType functionType;
+                    String methodType;
+
                     if (qualifiers.contains(Qualifier.REMOTE)) {
                         functionType = FunctionType.REMOTE;
+                        methodType = "Remote Function";
                     } else if (qualifiers.contains(Qualifier.RESOURCE)) {
                         functionType = FunctionType.RESOURCE;
-                    } else if (qualifiers.contains(Qualifier.PUBLIC)) {
-                        functionType = FunctionType.FUNCTION;
+                        methodType = "Resource Function";
                     } else {
-                        continue;
+                        functionType = FunctionType.FUNCTION;
+                        methodType = "Method";
                     }
-                    int functionId = processFunctionSymbol(semanticModel, methodSymbol, methodSymbol, packageId,
-                            functionType, moduleName, errorTypeSymbol, module);
-                    if (functionId == -1) {
-                        continue;
+
+                    int functionId = processFunctionSymbol(
+                        semanticModel, methodSymbol, methodSymbol,
+                        packageId, functionType, moduleName, errorTypeSymbol, module
+                    );
+
+                    if (functionId != -1) {
+                        // Link method to class via ClassMethod table
+                        DatabaseManager.insertClassMethod(classTypeId, functionId, methodType);
+
+                        if (isClient && clientId != -1) {
+                            DatabaseManager.mapConnectorAction(functionId, clientId);
+                        }
                     }
-                    DatabaseManager.mapConnectorAction(functionId, connectorId);
                 }
             }
         }
-    }
-
-    private static boolean hasAllQualifiers(List<Qualifier> actualQualifiers, List<Qualifier> expectedQualifiers) {
-        return !new HashSet<>(actualQualifiers).containsAll(expectedQualifiers);
     }
 
     private static int processFunctionSymbol(SemanticModel semanticModel, FunctionSymbol functionSymbol,
@@ -325,5 +407,280 @@ class IndexGenerator {
             }
             return FunctionParameterKind.valueOf(value);
         }
+    }
+
+    /**
+     * Processes a type definition symbol and inserts it into the database.
+     * Handles records, unions, classes, and other type definitions.
+     */
+    private static void processTypeDefinition(TypeDefinitionSymbol typeDefSymbol, int packageId,
+                                             SemanticModel semanticModel, Module module) {
+        Optional<String> nameOpt = typeDefSymbol.getName();
+        if (nameOpt.isEmpty()) {
+            return;
+        }
+
+        String name = nameOpt.get();
+        String description = getDescription(typeDefSymbol);
+        TypeSymbol typeDescriptor = typeDefSymbol.typeDescriptor();
+
+        // Get the raw type to determine the actual type kind
+        TypeSymbol rawType = CommonUtils.getRawType(typeDescriptor);
+        TypeDescKind typeKind = rawType.typeKind();
+
+        String typeCategory = mapTypeDescKindToCategory(typeKind);
+        String baseType = typeDescriptor.signature();
+
+        // Insert the type definition (value field is reserved for constant values, null for now)
+        int typeId = DatabaseManager.insertTypeDefinition(packageId, name, description, typeCategory, baseType);
+
+        if (typeId == -1) {
+            LOGGER.warning("Failed to insert type definition: " + name);
+            return;
+        }
+
+        // Process specific type categories
+        switch (typeKind) {
+            case RECORD:
+                if (rawType instanceof RecordTypeSymbol recordType) {
+                    processRecordType(recordType, typeId, semanticModel, module);
+                }
+                break;
+            case UNION:
+                if (rawType instanceof UnionTypeSymbol unionType) {
+                    processUnionType(unionType, typeId);
+                }
+                break;
+            case TYPE_REFERENCE:
+                // Handle type aliases - for now, the base_type field contains the full signature
+                // Future enhancement: could extract and store additional type alias information
+                break;
+            default:
+                // Other types (primitives, arrays, etc.) are stored with their signature
+                break;
+        }
+    }
+
+    /**
+     * Processes an enum symbol and inserts it into the database.
+     */
+    private static void processEnumType(EnumSymbol enumSymbol, int packageId) {
+        Optional<String> nameOpt = enumSymbol.getName();
+        if (nameOpt.isEmpty()) {
+            return;
+        }
+
+        String name = nameOpt.get();
+        String description = getDescription(enumSymbol);
+
+        // Insert the enum as a type definition
+        int typeId = DatabaseManager.insertTypeDefinition(packageId, name, description, "Enum",
+                null);
+
+        if (typeId == -1) {
+            LOGGER.warning("Failed to insert enum type: " + name);
+            return;
+        }
+
+        // Insert enum members
+        List<io.ballerina.compiler.api.symbols.ConstantSymbol> members = enumSymbol.members();
+        int ordinal = 0;
+        for (io.ballerina.compiler.api.symbols.ConstantSymbol member : members) {
+            Optional<String> memberNameOpt = member.getName();
+            if (memberNameOpt.isEmpty()) {
+                continue;
+            }
+            String memberName = memberNameOpt.get();
+            String memberDescription = getDescription(member);
+            DatabaseManager.insertEnumMember(typeId, memberName, memberDescription, ordinal++);
+        }
+    }
+
+    /**
+     * Processes a record type and inserts its fields into the database.
+     * Also processes type links for record fields.
+     */
+    private static void processRecordType(RecordTypeSymbol recordType, int typeId,
+                                         SemanticModel semanticModel, Module module) {
+        Map<String, RecordFieldSymbol> fields = recordType.fieldDescriptors();
+
+        for (Map.Entry<String, RecordFieldSymbol> entry : fields.entrySet()) {
+            RecordFieldSymbol fieldSymbol = entry.getValue();
+            Optional<String> fieldNameOpt = fieldSymbol.getName();
+            if (fieldNameOpt.isEmpty()) {
+                continue;
+            }
+
+            String fieldName = fieldNameOpt.get();
+            String fieldDescription = getDescription(fieldSymbol);
+            TypeSymbol fieldTypeSymbol = fieldSymbol.typeDescriptor();
+            String fieldType = fieldTypeSymbol.signature();
+
+            // Convert to JSON format for consistency with context.json migration
+            String fieldTypeJson = String.format("{\"name\":\"%s\"}",
+                                                escapeJson(fieldType));
+
+            int optional = fieldSymbol.isOptional() ? 1 : 0;
+
+            int fieldId = DatabaseManager.insertRecordField(typeId, fieldName, fieldDescription,
+                    fieldTypeJson, optional);
+
+            // Process type links for this field
+            if (fieldId != -1) {
+                processFieldTypeLinks(fieldSymbol, fieldId, semanticModel, module);
+            }
+        }
+
+        // Handle rest field if present
+        if (recordType.restTypeDescriptor().isPresent()) {
+            TypeSymbol restType = recordType.restTypeDescriptor().get();
+            String restFieldType = String.format("{\"name\":\"...%s\"}",
+                                                escapeJson(restType.signature()));
+            DatabaseManager.insertRecordField(typeId, "...", "Rest field", restFieldType, 0);
+        }
+    }
+
+    /**
+     * Processes a union type and inserts its member types into the database.
+     */
+    private static void processUnionType(UnionTypeSymbol unionType, int typeId) {
+        List<TypeSymbol> memberTypes = unionType.memberTypeDescriptors();
+        int ordinal = 0;
+
+        for (TypeSymbol memberType : memberTypes) {
+            String memberTypeName = memberType.signature();
+            DatabaseManager.insertUnionMember(typeId, memberTypeName, ordinal++);
+        }
+    }
+
+    /**
+     * Maps TypeDescKind to type category string for database storage.
+     */
+    private static String mapTypeDescKindToCategory(TypeDescKind typeKind) {
+        return switch (typeKind) {
+            case RECORD -> "Record";
+            case UNION -> "Union";
+            case OBJECT -> "Class";
+            case ERROR -> "Error";
+            case TYPE_REFERENCE -> "Other";
+            default -> "Other";
+        };
+    }
+
+    /**
+     * Extracts description from a documentable symbol.
+     */
+    private static String getDescription(Symbol symbol) {
+        if (symbol instanceof Documentable documentable) {
+            Optional<Documentation> docOpt = documentable.documentation();
+            if (docOpt.isPresent()) {
+                return docOpt.get().description().orElse("");
+            }
+        }
+        return "";
+    }
+
+    /**
+     * Escapes special characters for JSON strings.
+     */
+    private static String escapeJson(String input) {
+        if (input == null) {
+            return "";
+        }
+        return input.replace("\\", "\\\\")
+                   .replace("\"", "\\\"")
+                   .replace("\n", "\\n")
+                   .replace("\r", "\\r")
+                   .replace("\t", "\\t");
+    }
+
+    /**
+     * Process a service declaration and insert it into the database.
+     */
+    private static void processServiceDeclaration(Symbol symbol, int packageId) {
+        String serviceType = "generic";
+        String instructions = null;
+        String testInstructions = null;
+        String listenerName = null;
+        String listenerConfig = null;
+
+        // Extract service description as instructions if available
+        if (symbol instanceof Documentable documentable) {
+            Optional<Documentation> docOpt = documentable.documentation();
+            if (docOpt.isPresent()) {
+                instructions = docOpt.get().description().orElse(null);
+            }
+        }
+
+        // Insert service definition
+        DatabaseManager.insertServiceDefinition(
+            packageId, serviceType, instructions,
+            listenerName, listenerConfig, testInstructions
+        );
+    }
+
+    /**
+     * Process type links for a record field by analyzing its type.
+     */
+    private static void processFieldTypeLinks(RecordFieldSymbol fieldSymbol, int fieldId,
+                                             SemanticModel semanticModel, Module module) {
+        TypeSymbol fieldTypeSymbol = fieldSymbol.typeDescriptor();
+        TypeSymbol fieldRawType = CommonUtils.getRawType(fieldTypeSymbol);
+
+        // Check if field type is a record or references a record
+        if (fieldRawType.typeKind() == TypeDescKind.TYPE_REFERENCE) {
+            // Extract type reference information
+            String targetTypeName = extractTypeName(fieldTypeSymbol.signature());
+            if (targetTypeName != null && !targetTypeName.isEmpty()) {
+                String category = "internal"; // Default to internal
+                String packageOrg = null;
+                String targetPackageName = null;
+
+                // Check if the type belongs to the current module
+                Optional<io.ballerina.compiler.api.symbols.ModuleSymbol> fieldModule =
+                    fieldTypeSymbol.getModule();
+                if (fieldModule.isPresent()) {
+                    io.ballerina.compiler.api.symbols.ModuleSymbol fieldModuleSymbol = fieldModule.get();
+
+                    // Compare module IDs to determine if it's external
+                    String currentModuleName = module.descriptor().name().toString();
+                    String currentOrgName = module.descriptor().org().value();
+                    String fieldModuleName = fieldModuleSymbol.id().moduleName();
+                    String fieldOrgName = fieldModuleSymbol.id().orgName();
+
+                    // If org or module names are different, it's an external link
+                    if (!currentOrgName.equals(fieldOrgName) || !currentModuleName.equals(fieldModuleName)) {
+                        category = "external";
+                        packageOrg = fieldOrgName;
+                        targetPackageName = fieldModuleSymbol.id().packageName();
+                    }
+                }
+
+                // Insert type link
+                DatabaseManager.insertTypeLink(
+                    fieldId, targetTypeName, category,
+                    packageOrg, targetPackageName
+                );
+            }
+        }
+    }
+
+    /**
+     * Extracts the type name from a type signature.
+     * For example, "ballerina/http:Request" -> "Request"
+     */
+    private static String extractTypeName(String signature) {
+        if (signature == null || signature.isEmpty()) {
+            return null;
+        }
+
+        // Handle qualified names (e.g., "ballerina/http:Request")
+        int colonIndex = signature.lastIndexOf(':');
+        if (colonIndex != -1) {
+            return signature.substring(colonIndex + 1);
+        }
+
+        // Handle simple names
+        return signature;
     }
 }
