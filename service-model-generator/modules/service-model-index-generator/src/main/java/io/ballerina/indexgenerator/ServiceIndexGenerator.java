@@ -126,8 +126,21 @@ class ServiceIndexGenerator {
 
                     packageMetadataInfo.name(), packageMetadataInfo.version());
             if (packageOpt.isEmpty()) {
-                LOGGER.warning("Package not found: " + org + "/" + packageMetadataInfo.name() + ":" +
-                        packageMetadataInfo.version());
+                boolean hasHardcodedModel = (packageMetadataInfo.serviceTypes() != null
+                        && !packageMetadataInfo.serviceTypes().isEmpty())
+                        || (packageMetadataInfo.initForm() != null && !packageMetadataInfo.initForm().isEmpty());
+                if (hasHardcodedModel) {
+                    // A trigger package that is not (yet) resolvable from Central but ships a fully
+                    // hand-authored model (e.g. ballerinax/telegram and ballerinax/whatsapp.business
+                    // before their Central release). Index it directly instead of discovering service
+                    // types from a semantic model.
+                    LOGGER.info("Indexing package from hardcoded model: " + org + "/"
+                            + packageMetadataInfo.name() + ":" + packageMetadataInfo.version());
+                    indexHardcodedPackage(org, packageMetadataInfo);
+                } else {
+                    LOGGER.warning("Package not found: " + org + "/" + packageMetadataInfo.name() + ":" +
+                            packageMetadataInfo.version());
+                }
                 return;
             }
             resolvedPackage = packageOpt.get();
@@ -237,6 +250,54 @@ class ServiceIndexGenerator {
                 String propertyName = entry.getKey();
                 ServiceInitializerProperty property = entry.getValue();
                 DatabaseManager.insertServiceInitializerProperty(packageId, propertyName, property.label(),
+                        property.description(), property.defaultValue(), property.placeholder(),
+                        GSON.toJson(property.types()), property.sourceKind());
+            }
+        }
+    }
+
+    /**
+     * Indexes a package whose model is fully hand-authored in {@code service_artifacts.json} and whose
+     * package is not resolvable from Central (e.g. {@code ballerinax/telegram} and
+     * {@code ballerinax/whatsapp.business} before their Central release, while they are only available in
+     * the local repository). No semantic model is consulted; the service declaration, service types,
+     * read-only metadata and init form are inserted directly.
+     */
+    private static void indexHardcodedPackage(String org, PackageMetadataInfo packageMetadataInfo) {
+        int packageId = DatabaseManager.insertPackage(org, packageMetadataInfo.name(),
+                packageMetadataInfo.version(), List.of());
+        if (packageId == -1) {
+            LOGGER.severe("Error inserting synthetic package to database: " + packageMetadataInfo.name());
+            return;
+        }
+
+        DatabaseManager.insertServiceDeclaration(packageId, packageMetadataInfo.serviceDeclaration());
+
+        Map<String, ServiceType> serviceTypes = packageMetadataInfo.serviceTypes();
+        if (serviceTypes != null) {
+            for (Map.Entry<String, ServiceType> entry : serviceTypes.entrySet()) {
+                ServiceType serviceType = entry.getValue();
+                int serviceTypeId = DatabaseManager.insertServiceType(packageId, serviceType);
+                for (ServiceTypeFunction function : serviceType.functions()) {
+                    int functionId = DatabaseManager.insertServiceTypeFunction(serviceTypeId, function);
+                    for (ServiceTypeFunctionParameter parameter : function.parameters()) {
+                        DatabaseManager.insertServiceTypeFunctionParameter(functionId, parameter);
+                    }
+                }
+            }
+        }
+
+        if (Objects.nonNull(packageMetadataInfo.readOnlyMetadata())) {
+            for (MetadataItem item : packageMetadataInfo.readOnlyMetadata()) {
+                DatabaseManager.insertServiceReadOnlyMetaData(packageId, item.key(),
+                        item.displayName(), item.kind());
+            }
+        }
+
+        if (Objects.nonNull(packageMetadataInfo.initForm())) {
+            for (Map.Entry<String, ServiceInitializerProperty> entry : packageMetadataInfo.initForm().entrySet()) {
+                ServiceInitializerProperty property = entry.getValue();
+                DatabaseManager.insertServiceInitializerProperty(packageId, entry.getKey(), property.label(),
                         property.description(), property.defaultValue(), property.placeholder(),
                         GSON.toJson(property.types()), property.sourceKind());
             }
